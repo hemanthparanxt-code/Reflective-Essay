@@ -1,6 +1,13 @@
 /*
 Aurora Reflective Essay evaluator — paste into DevTools Console on the
-Faculty Portal's Evaluate page. Start the Python backend first.
+Faculty Portal's Evaluate page.
+
+RENDER DEPLOYMENT INSTRUCTIONS:
+1. Deploy this backend to Render (Web Service).
+2. Set CONFIG.BACKEND to your Render URL ending with "/evaluate":
+   Example: BACKEND: "https://aurora-essay-evaluator.onrender.com/evaluate"
+3. (Optional) If running locally instead of Render:
+   BACKEND: "http://127.0.0.1:8765/evaluate"
 
 Safety: DRY_RUN defaults to true. Inspect results, then set false only after
 testing the PDF download, question matching, and points field on one student.
@@ -8,13 +15,25 @@ The script stops if it cannot safely identify the PDF or the points input.
 */
 (async function () {
   const CONFIG = {
-    BACKEND: "http://127.0.0.1:8765/evaluate",
+    // ⬇️ REPLACE THIS WITH YOUR RENDER URL (or keep localhost if running locally) ⬇️
+    BACKEND: "https://your-service-name.onrender.com/evaluate",
     DRY_RUN: true,             // change to false after a successful test
     AUTO_SAVE_NEXT: false,     // enable only after validating one-student test
     NEXT_TIMEOUT: 12000,
     POLL_MS: 200,
     MAX_STUDENTS_PER_RUN: 73
   };
+
+  // Quick check for placeholder URL
+  if (CONFIG.BACKEND.includes("your-service-name.onrender.com")) {
+    console.error(
+      "❌ CONFIG ERROR: Please update CONFIG.BACKEND with your actual Render URL!\n" +
+      "Example: BACKEND: \"https://aurora-essay-evaluator.onrender.com/evaluate\"\n" +
+      "Or if testing locally: BACKEND: \"http://127.0.0.1:8765/evaluate\""
+    );
+    return;
+  }
+
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   function getStudentInfo() {
@@ -85,7 +104,7 @@ The script stops if it cannot safely identify the PDF or the points input.
       });
     if (candidates.length === 1) return candidates[0];
 
-    // Screenshot layout may have a plain numeric input whose nearby label says "Points (out of 200)".
+    // Layout may have a plain numeric input whose nearby label says "Points (out of 200)".
     const fallback = [...document.querySelectorAll("input[type=number],input:not([type=hidden])")]
       .filter(el => {
         const p = el.parentElement?.parentElement?.innerText || "";
@@ -123,8 +142,30 @@ The script stops if it cannot safely identify the PDF or the points input.
   }
 
   const results = [];
-  console.log("Reflective Essay Evaluator started.", CONFIG);
-  console.log("Backend health check: http://127.0.0.1:8765/health");
+  console.log("🚀 Reflective Essay Evaluator started.", CONFIG);
+
+  // Pre-flight health check to verify connection & wake up Render Free Tier service
+  const healthUrl = CONFIG.BACKEND.replace(/\/evaluate\/?$/, "/health");
+  console.log(`Connecting to backend at: ${healthUrl}...`);
+  try {
+    const healthRes = await fetch(healthUrl);
+    if (healthRes.ok) {
+      const healthData = await healthRes.json();
+      if (!healthData.api_key_configured) {
+        console.warn("⚠️ WARNING: Backend responded, but GEMINI_API_KEY is not configured! Check Render environment variables.");
+      } else {
+        console.log(`✅ Backend connected! Model: ${healthData.model}`);
+      }
+    } else {
+      console.warn(`⚠️ Health check returned HTTP ${healthRes.status}.`);
+    }
+  } catch (err) {
+    console.warn(
+      `⚠️ Could not reach health check at ${healthUrl}.\n` +
+      `Note: If using Render Free Tier, the backend spins down after inactivity and may take 30–50s to wake up.\n` +
+      `You can also open ${healthUrl} directly in a new tab to wake it up.`
+    );
+  }
 
   for (let count = 0; count < CONFIG.MAX_STUDENTS_PER_RUN; count++) {
     const student = getStudentInfo();

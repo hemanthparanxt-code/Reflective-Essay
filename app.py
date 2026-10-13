@@ -1,26 +1,32 @@
 """
-Aurora Reflective Essay Evaluator — local backend
-Uses Gemini to evaluate extracted PDF text. Keep GEMINI_API_KEY on this machine;
+Aurora Reflective Essay Evaluator — Backend (Render & Local compatible)
+Uses Gemini to evaluate extracted PDF text. Keep GEMINI_API_KEY in environment variables;
 never paste it into browser-console JavaScript.
 """
 import os
 import re
+import io
 import json
-import tempfile
-from pathlib import Path
-
+import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pypdf import PdfReader
 from google import genai
 from google.genai import types
 
-app = Flask(__name__)
-CORS(app, resources={r"/evaluate": {"origins": "*"}})
+# Configure logging for production and local environments
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("aurora_evaluator")
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-API_KEY = os.getenv("GEMINI_API_KEY")
-MAX_PDF_BYTES = 20 * 1024 * 1024
+app = Flask(__name__)
+
+# Allow Cross-Origin Resource Sharing from any origin (e.g., faculty portal pages)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+MAX_PDF_BYTES = 20 * 1024 * 1024  # 20 MB
 
 QUESTIONS = [
     {
@@ -45,31 +51,32 @@ QUESTIONS = [
     },
 ]
 
+def get_api_key() -> str | None:
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+def get_model_name() -> str:
+    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     if not pdf_bytes:
         raise ValueError("No PDF file was received.")
     if len(pdf_bytes) > MAX_PDF_BYTES:
         raise ValueError("PDF exceeds the 20 MB limit.")
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        path = tmp.name
-    try:
-        reader = PdfReader(path)
-        text_parts = []
-        for page in reader.pages:
-            text_parts.append(page.extract_text() or "")
-        text = "\n".join(text_parts).strip()
-        if len(text) < 100:
-            raise ValueError(
-                "Very little selectable text was extracted. This may be a scanned/image-only PDF; "
-                "OCR is required before this evaluator can grade it."
-            )
-        return text[:60000]
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+
+    stream = io.BytesIO(pdf_bytes)
+    reader = PdfReader(stream)
+    text_parts = []
+    for page_idx, page in enumerate(reader.pages):
+        page_text = page.extract_text() or ""
+        text_parts.append(page_text)
+    
+    text = "\n".join(text_parts).strip()
+    if len(text) < 100:
+        raise ValueError(
+            "Very little selectable text was extracted. This may be a scanned/image-only PDF; "
+            "OCR is required before this evaluator can grade it."
+        )
+    return text[:60000]
 
 def make_prompt(essay_text: str) -> str:
     question_block = "\n\n".join(
@@ -130,44 +137,87 @@ STUDENT SUBMISSION TEXT:
 >>>
 """
 
+@app.get("/")
+def index():
+    api_key = get_api_key()
+    model = get_model_name()
+    return jsonify({
+        "status": "online",
+        "service": "Aurora Reflective Essay Evaluator Backend",
+        "model": model,
+        "api_key_configured": bool(api_key),
+        "endpoints": {
+            "health": "/health",
+            "evaluate": "POST /evaluate"
+        }
+    })
+
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "model": MODEL, "api_key_configured": bool(API_KEY)})
+    api_key = get_api_key()
+    model = get_model_name()
+    return jsonify({
+        "ok": True,
+        "model": model,
+        "api_key_configured": bool(api_key)
+    })
 
 @app.post("/evaluate")
 def evaluate():
-    if not API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY is not configured on the backend."}), 500
+    api_key = get_api_key()
+    model = get_model_name()
+
+    if not api_key:
+        logger.error("GEMINI_API_KEY is not configured.")
+        return jsonify({
+            "error": "GEMINI_API_KEY is not configured on the backend. Please set GEMINI_API_KEY in Render Environment Variables."
+        }), 500
+
     if "file" not in request.files:
         return jsonify({"error": "Request must include a PDF in the 'file' field."}), 400
+
     uploaded = request.files["file"]
-    if not uploaded.filename.lower().endswith(".pdf"):
+    if not (uploaded.filename and uploaded.filename.lower().endswith(".pdf")):
         return jsonify({"error": "The uploaded submission does not look like a PDF."}), 400
+
     try:
-        essay_text = extract_pdf_text(uploaded.read())
-        client = genai.Client(api_key=API_KEY)
+        pdf_bytes = uploaded.read()
+        logger.info("Received PDF: %s (%d bytes)", uploaded.filename, len(pdf_bytes))
+
+        essay_text = extract_pdf_text(pdf_bytes)
+        logger.info("Extracted %d characters from PDF. Calling Gemini model: %s", len(essay_text), model)
+
+        client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
-            model=MODEL,
+            model=model,
             contents=make_prompt(essay_text),
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
             ),
         )
-        raw = response.text or ""
+
+        raw = (response.text or "").strip()
+        # Clean potential markdown fences
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
         data = json.loads(raw)
         qs = data.get("questions", [])
         if len(qs) != 5:
-            raise ValueError("Model returned an invalid number of question scores.")
+            raise ValueError(f"Model returned {len(qs)} question scores instead of expected 5.")
+
         scores = []
         for i, q in enumerate(qs, start=1):
             if int(q.get("number", -1)) != i:
                 raise ValueError("Question entries are not in the expected order.")
             score = int(q.get("score", -1))
             if not 0 <= score <= 40:
-                raise ValueError(f"Question {i} score is outside 0–40.")
+                raise ValueError(f"Question {i} score ({score}) is outside allowed range 0–40.")
             q["score"] = score
             scores.append(score)
+
         total = sum(scores)
         if int(data.get("total", -1)) != total:
             data["total"] = total
@@ -175,15 +225,25 @@ def evaluate():
             data["review_reason"] = (
                 (data.get("review_reason", "") + " Model total did not match question-score sum; total corrected.")
             ).strip()
+
         data["total"] = total
-        data["model"] = MODEL
+        data["model"] = model
         data["extracted_characters"] = len(essay_text)
+        logger.info("Grading successful: %d/200 points awarded.", total)
         return jsonify(data)
+
     except Exception as exc:
+        logger.exception("Evaluation failed: %s", str(exc))
         return jsonify({"error": str(exc)}), 500
 
 if __name__ == "__main__":
-    if not API_KEY:
-        print("WARNING: Set GEMINI_API_KEY before grading.")
-    print(f"Starting local evaluator on http://127.0.0.1:8765 (model={MODEL})")
-    app.run(host="127.0.0.1", port=8765, debug=False)
+    api_key = get_api_key()
+    model = get_model_name()
+    if not api_key:
+        print("WARNING: GEMINI_API_KEY environment variable is not set.")
+
+    # Render injects PORT; fallback to 8765 for local dev
+    port = int(os.environ.get("PORT", 8765))
+    host = "0.0.0.0"
+    print(f"Starting evaluator backend on http://{host}:{port} (model={model})")
+    app.run(host=host, port=port, debug=False)
