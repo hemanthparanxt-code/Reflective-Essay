@@ -2,37 +2,21 @@
 Aurora Reflective Essay evaluator — paste into DevTools Console on the
 Faculty Portal's Evaluate page.
 
-RENDER DEPLOYMENT INSTRUCTIONS:
-1. Deploy this backend to Render (Web Service).
-2. Set CONFIG.BACKEND to your Render URL ending with "/evaluate":
-   Example: BACKEND: "https://aurora-essay-evaluator.onrender.com/evaluate"
-3. (Optional) If running locally instead of Render:
-   BACKEND: "http://127.0.0.1:8765/evaluate"
+RENDER BACKEND:
+Connected to: https://reflective-essay-1.onrender.com/evaluate
 
 Safety: DRY_RUN defaults to true. Inspect results, then set false only after
-testing the PDF download, question matching, and points field on one student.
-The script stops if it cannot safely identify the PDF or the points input.
+testing question matching and points field on one student.
 */
 (async function () {
   const CONFIG = {
-    // ⬇️ REPLACE THIS WITH YOUR RENDER URL (or keep localhost if running locally) ⬇️
-    BACKEND: "https://your-service-name.onrender.com/evaluate",
+    BACKEND: "https://reflective-essay-1.onrender.com/evaluate",
     DRY_RUN: true,             // change to false after a successful test
     AUTO_SAVE_NEXT: false,     // enable only after validating one-student test
     NEXT_TIMEOUT: 12000,
     POLL_MS: 200,
     MAX_STUDENTS_PER_RUN: 73
   };
-
-  // Quick check for placeholder URL
-  if (CONFIG.BACKEND.includes("your-service-name.onrender.com")) {
-    console.error(
-      "❌ CONFIG ERROR: Please update CONFIG.BACKEND with your actual Render URL!\n" +
-      "Example: BACKEND: \"https://aurora-essay-evaluator.onrender.com/evaluate\"\n" +
-      "Or if testing locally: BACKEND: \"http://127.0.0.1:8765/evaluate\""
-    );
-    return;
-  }
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -59,37 +43,57 @@ The script stops if it cannot safely identify the PDF or the points input.
            anchors.find(a => /open/i.test(a.innerText || "") && a.href);
   }
 
-  async function fetchSubmissionPdf() {
-    const link = findSubmittedPdfLink();
-    if (!link) throw new Error("Could not find the submitted PDF link. No marks were changed.");
-    const response = await fetch(link.href, { credentials: "include" });
-    if (!response.ok) throw new Error(`PDF download failed: HTTP ${response.status}.`);
-    const blob = await response.blob();
-    if (blob.size < 100 || (blob.type && !/pdf/i.test(blob.type))) {
-      // Some portals return application/octet-stream for valid PDFs; validate header too.
-      const bytes = new Uint8Array(await blob.slice(0, 5).arrayBuffer());
-      const signature = String.fromCharCode(...bytes);
-      if (signature !== "%PDF-") throw new Error("The portal link did not return a readable PDF.");
-    }
-    return { blob, filename: (link.href.split("/").pop() || "submission.pdf").split("?")[0] };
-  }
-
-  async function evaluatePdf() {
-    const { blob, filename } = await fetchSubmissionPdf();
-    const form = new FormData();
-    form.append("file", blob, filename.toLowerCase().endsWith(".pdf") ? filename : "submission.pdf");
-    const response = await fetch(CONFIG.BACKEND, { method: "POST", body: form });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `Evaluator returned HTTP ${response.status}`);
+  function validateEvaluationData(data) {
     if (!Number.isInteger(data.total) || data.total < 0 || data.total > 200) {
-      throw new Error("Evaluator returned an invalid total.");
+      throw new Error("Evaluator returned an invalid total: " + data.total);
     }
     if (!Array.isArray(data.questions) || data.questions.length !== 5) {
       throw new Error("Evaluator did not return five question scores.");
     }
     const sum = data.questions.reduce((n, q) => n + Number(q.score), 0);
-    if (sum !== data.total) throw new Error(`Score mismatch: question sum ${sum}, total ${data.total}.`);
-    return data;
+    if (sum !== data.total) {
+      throw new Error(`Score mismatch: question sum ${sum}, total ${data.total}.`);
+    }
+  }
+
+  async function evaluatePdf() {
+    const link = findSubmittedPdfLink();
+    if (!link) throw new Error("Could not find the submitted PDF link. No marks were changed.");
+    const pdfUrl = link.href;
+    console.log("Found submitted PDF link:", pdfUrl);
+
+    // Method 1: Send the PDF URL directly to the Render backend.
+    // The backend downloads the PDF server-to-server, bypassing AWS S3 browser CORS blocks.
+    console.log("Sending PDF URL to backend for server-side processing...");
+    try {
+      const response = await fetch(CONFIG.BACKEND, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pdf_url: pdfUrl })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok) {
+        validateEvaluationData(data);
+        return data;
+      }
+      console.warn("Server-side PDF URL download returned:", data.error || response.status, "Trying browser download fallback...");
+    } catch (err) {
+      console.warn("Server-side download error:", err.message, "Trying browser download fallback...");
+    }
+
+    // Method 2 (Fallback): If backend direct download is blocked by authentication, fetch via browser
+    console.log("Attempting browser-side fetch fallback...");
+    const browserRes = await fetch(pdfUrl, { credentials: "include" });
+    if (!browserRes.ok) throw new Error(`Browser PDF download failed: HTTP ${browserRes.status}`);
+    const blob = await browserRes.blob();
+    const filename = (pdfUrl.split("/").pop() || "submission.pdf").split("?")[0];
+    const form = new FormData();
+    form.append("file", blob, filename.toLowerCase().endsWith(".pdf") ? filename : "submission.pdf");
+    const uploadRes = await fetch(CONFIG.BACKEND, { method: "POST", body: form });
+    const uploadData = await uploadRes.json().catch(() => ({}));
+    if (!uploadRes.ok) throw new Error(uploadData.error || `Evaluator returned HTTP ${uploadRes.status}`);
+    validateEvaluationData(uploadData);
+    return uploadData;
   }
 
   function findPointsInput() {
@@ -146,25 +150,18 @@ The script stops if it cannot safely identify the PDF or the points input.
 
   // Pre-flight health check to verify connection & wake up Render Free Tier service
   const healthUrl = CONFIG.BACKEND.replace(/\/evaluate\/?$/, "/health");
-  console.log(`Connecting to backend at: ${healthUrl}...`);
   try {
     const healthRes = await fetch(healthUrl);
     if (healthRes.ok) {
       const healthData = await healthRes.json();
       if (!healthData.api_key_configured) {
-        console.warn("⚠️ WARNING: Backend responded, but GEMINI_API_KEY is not configured! Check Render environment variables.");
+        console.warn("⚠️ WARNING: GEMINI_API_KEY is not configured on Render!");
       } else {
         console.log(`✅ Backend connected! Model: ${healthData.model}`);
       }
-    } else {
-      console.warn(`⚠️ Health check returned HTTP ${healthRes.status}.`);
     }
   } catch (err) {
-    console.warn(
-      `⚠️ Could not reach health check at ${healthUrl}.\n` +
-      `Note: If using Render Free Tier, the backend spins down after inactivity and may take 30–50s to wake up.\n` +
-      `You can also open ${healthUrl} directly in a new tab to wake it up.`
-    );
+    console.warn(`⚠️ Backend check: ${err.message}. If starting cold, Render may take ~30s.`);
   }
 
   for (let count = 0; count < CONFIG.MAX_STUDENTS_PER_RUN; count++) {
@@ -176,8 +173,10 @@ The script stops if it cannot safely identify the PDF or the points input.
       !!findSubmittedPdfLink();
 
     if (!hasSubmission) {
-      const result = { student: student.current, total: student.total, submitted: false, score: 0,
-        note: "No submitted PDF link detected; verify portal status manually." };
+      const result = {
+        student: student.current, total: student.total, submitted: false, score: 0,
+        note: "No submitted PDF link detected; verify portal status manually."
+      };
       results.push(result);
       console.warn(result);
       if (CONFIG.DRY_RUN) {

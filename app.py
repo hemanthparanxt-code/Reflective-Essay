@@ -8,6 +8,7 @@ import re
 import io
 import json
 import logging
+import urllib.request
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pypdf import PdfReader
@@ -66,7 +67,7 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     stream = io.BytesIO(pdf_bytes)
     reader = PdfReader(stream)
     text_parts = []
-    for page_idx, page in enumerate(reader.pages):
+    for page in reader.pages:
         page_text = page.extract_text() or ""
         text_parts.append(page_text)
     
@@ -173,19 +174,52 @@ def evaluate():
             "error": "GEMINI_API_KEY is not configured on the backend. Please set GEMINI_API_KEY in Render Environment Variables."
         }), 500
 
-    if "file" not in request.files:
-        return jsonify({"error": "Request must include a PDF in the 'file' field."}), 400
+    pdf_bytes = None
+    filename = "submission.pdf"
 
-    uploaded = request.files["file"]
-    if not (uploaded.filename and uploaded.filename.lower().endswith(".pdf")):
-        return jsonify({"error": "The uploaded submission does not look like a PDF."}), 400
+    # Option 1: PDF URL provided in JSON or Form Data (bypasses browser CORS on S3/cloud storage)
+    pdf_url = None
+    if request.is_json:
+        pdf_url = request.json.get("pdf_url")
+    elif request.form.get("pdf_url"):
+        pdf_url = request.form.get("pdf_url")
+
+    if pdf_url:
+        logger.info("Downloading PDF directly from URL: %s", pdf_url)
+        try:
+            req = urllib.request.Request(
+                pdf_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                pdf_bytes = resp.read(MAX_PDF_BYTES + 1)
+                if len(pdf_bytes) > MAX_PDF_BYTES:
+                    return jsonify({"error": "PDF exceeds the 20 MB limit."}), 400
+                filename = pdf_url.split("?")[0].split("/")[-1] or "submission.pdf"
+        except Exception as dl_err:
+            logger.exception("Failed to download PDF from URL: %s", str(dl_err))
+            return jsonify({"error": f"Failed to download PDF from URL: {str(dl_err)}"}), 400
+
+    # Option 2: File uploaded directly via multipart/form-data
+    elif "file" in request.files:
+        uploaded = request.files["file"]
+        if not (uploaded.filename and uploaded.filename.lower().endswith(".pdf")):
+            return jsonify({"error": "The uploaded submission does not look like a PDF."}), 400
+        pdf_bytes = uploaded.read()
+        filename = uploaded.filename
+
+    else:
+        return jsonify({"error": "Request must include either 'pdf_url' or a PDF file in the 'file' field."}), 400
+
+    if not pdf_bytes:
+        return jsonify({"error": "No PDF data could be retrieved."}), 400
 
     try:
-        pdf_bytes = uploaded.read()
-        logger.info("Received PDF: %s (%d bytes)", uploaded.filename, len(pdf_bytes))
-
+        logger.info("Processing PDF: %s (%d bytes)", filename, len(pdf_bytes))
         essay_text = extract_pdf_text(pdf_bytes)
-        logger.info("Extracted %d characters from PDF. Calling Gemini model: %s", len(essay_text), model)
+        logger.info("Extracted %d characters. Calling Gemini model: %s", len(essay_text), model)
 
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
